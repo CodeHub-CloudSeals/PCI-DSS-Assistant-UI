@@ -1,0 +1,28 @@
+# Core UI
+streamlit
+
+# Data handling
+pandas
+numpy
+
+# API requests / integrations
+requests
+
+# For Excel / CSV export
+openpyxl
+xlsxwriter
+
+# For PDF generation
+reportlab
+
+# Optional: If you plan to use Google Cloud APIs (Asset Inventory, DLP, etc.)
+google-cloud-asset
+google-cloud-dlp
+google-cloud-storage
+
+# For structured config / YAML support
+pyyaml
+
+# For basic AI / text handling (if needed later)
+scikit-learn
+nltk
