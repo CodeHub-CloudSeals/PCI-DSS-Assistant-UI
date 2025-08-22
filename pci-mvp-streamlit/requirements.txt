@@ -23,10 +23,6 @@ google-cloud-storage
 # For structured config / YAML support
 pyyaml
 
-# For basic AI / text handling (if needed later)
-scikit-learn
-nltk
-
 # Chatbot Functionality
 streamlit-chat
 google-generativeai
