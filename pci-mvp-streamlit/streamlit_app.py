@@ -3,21 +3,22 @@ import json
 from typing import List
 import pandas as pd
 import streamlit as st
+import requests
 
 # ------------------------------
 # Page config
 # ------------------------------
 st.set_page_config(
-    page_title="PCI DSS Compliance MVP (Single Screen)",
+    page_title="PCI DSS Compliance MVP",
     page_icon="✅",
     layout="wide",
 )
 
-st.title("PCI DSS Compliance MVP — Single Screen Demo")
+st.title("PCI DSS Compliance MVP")
 st.caption("Automates: Inventory → Scope → Controls → Remediation → Report")
 
 # ------------------------------
-# Demo inventory (used if no upload)
+# Demo inventory (fallback)
 # ------------------------------
 def demo_inventory_df() -> pd.DataFrame:
     data = [
@@ -57,21 +58,32 @@ def demo_inventory_df() -> pd.DataFrame:
     return pd.DataFrame(data)
 
 # ------------------------------
+# Fetch inventory from MockAPI
+# ------------------------------
+def fetch_inventory_from_api() -> pd.DataFrame:
+    url = "https://68a71bb6639c6a54e9a100a9.mockapi.io/Inventory"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return pd.json_normalize(data)
+        else:
+            return pd.DataFrame([data])
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch from API, using demo data instead. Error: {e}")
+        return demo_inventory_df()
+
+# ------------------------------
 # Uploads + parsing
 # ------------------------------
-with st.expander("Uploads (optional) — Inventory & DLP", expanded=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        inv_file = st.file_uploader("Inventory (CSV or JSON)", type=["csv", "json"])
-        st.caption("Expected cols (min): asset_id, name, type, environment, region, "
-                   "chd_present, stores_chd, processes_chd, transmits_chd, network_segment, "
-                   "encryption_at_rest, encryption_in_transit, firewall_enabled, logging_enabled, owner")
-    with c2:
-        dlp_file = st.file_uploader("DLP findings CSV (asset_id, sensitive_found)", type=["csv"])
+with st.sidebar.expander("Uploads (optional) — Inventory & DLP", expanded=False):
+    inv_file = st.file_uploader("Inventory (CSV or JSON)", type=["csv", "json"])
+    dlp_file = st.file_uploader("DLP findings CSV (asset_id, sensitive_found)", type=["csv"])
 
 def parse_inventory_upload(upload) -> pd.DataFrame:
     if upload is None:
-        return demo_inventory_df()
+        return fetch_inventory_from_api()
     name = upload.name.lower()
     if name.endswith(".csv"):
         return pd.read_csv(upload)
@@ -105,14 +117,13 @@ except Exception as e:
 # ------------------------------
 # Scope Classifier
 # ------------------------------
-PCI_SCOPE_NOTE = (
+PCI_SCOPE_NOTE = (  
     "Scoping rule (simplified): Systems that store, process, or transmit CHD, "
     "and systems that can impact the security of the CDE, are in scope."
 )
 
 def classify_scope(inv_df: pd.DataFrame) -> pd.DataFrame:
     df = inv_df.copy()
-    # in-scope if any CHD flags OR in CDE/DMZ OR DLP found CHD
     in_scope = (
         df.get("stores_chd", False).fillna(False)
         | df.get("processes_chd", False).fillna(False)
@@ -144,34 +155,10 @@ scoped_df = classify_scope(inv_df)
 # Control Mapper
 # ------------------------------
 CONTROL_LIBRARY = [
-    {
-        "req_id": "REQ-01",
-        "title": "Firewall controls",
-        "text": "Restrict inbound/outbound traffic with firewall/ACL at network boundaries.",
-        "field": "firewall_enabled",
-        "expected": True,
-    },
-    {
-        "req_id": "REQ-02",
-        "title": "Encryption in transit",
-        "text": "Encrypt CHD transmissions over open/public networks.",
-        "field": "encryption_in_transit",
-        "expected": True,
-    },
-    {
-        "req_id": "REQ-03",
-        "title": "Encryption at rest",
-        "text": "Render CHD unreadable wherever it is stored.",
-        "field": "encryption_at_rest",
-        "expected": True,
-    },
-    {
-        "req_id": "REQ-04",
-        "title": "Logging & monitoring",
-        "text": "Enable logging to support security monitoring and forensics.",
-        "field": "logging_enabled",
-        "expected": True,
-    },
+    {"req_id": "REQ-01", "title": "Firewall controls", "text": "Restrict inbound/outbound traffic.", "field": "firewall_enabled", "expected": True},
+    {"req_id": "REQ-02", "title": "Encryption in transit", "text": "Encrypt CHD transmissions.", "field": "encryption_in_transit", "expected": True},
+    {"req_id": "REQ-03", "title": "Encryption at rest", "text": "Render CHD unreadable wherever stored.", "field": "encryption_at_rest", "expected": True},
+    {"req_id": "REQ-04", "title": "Logging & monitoring", "text": "Enable logging to support forensics.", "field": "logging_enabled", "expected": True},
 ]
 
 def build_control_matrix(scoped: pd.DataFrame) -> pd.DataFrame:
@@ -203,44 +190,28 @@ def remediation_suggestion(row: pd.Series) -> str:
     if row["req_id"] == "REQ-02" and not row["actual"]:
         return "Enable TLS 1.2+; enforce HTTPS; disable weak ciphers."
     if row["req_id"] == "REQ-03" and not row["actual"]:
-        return "Enable disk/DB encryption (KMS); rotate keys; document key mgmt."
+        return "Enable DB/disk encryption with KMS."
     if row["req_id"] == "REQ-01" and not row["actual"]:
-        return "Apply perimeter/CDE firewall rules; default deny; allowlist only."
+        return "Apply firewall rules: default deny; allowlist only."
     if row["req_id"] == "REQ-04" and not row["actual"]:
-        return "Enable audit logging; centralize logs (SIEM); set retention & alerts."
+        return "Enable audit logging; centralize logs (SIEM)."
     return ""
-
-def scope_reduction_tips(asset_row: pd.Series) -> List[str]:
-    tips = []
-    if asset_row.get("in_scope"):
-        if asset_row.get("stores_chd"):
-            tips.append("Tokenize PANs to remove CHD at rest.")
-        if asset_row.get("processes_chd") or asset_row.get("transmits_chd"):
-            tips.append("Outsource payment processing to a PCI-compliant PSP.")
-        if str(asset_row.get("network_segment", "")).lower() != "cde":
-            tips.append("Segment the CDE; restrict routes.")
-    return tips
 
 def build_remediation(scoped: pd.DataFrame, controls: pd.DataFrame) -> pd.DataFrame:
     gaps = controls[(controls["in_scope"]) & (controls["status"] == "Gap")].copy()
     if gaps.empty:
-        return pd.DataFrame(columns=["asset_id","asset","req_id","requirement","gap","remediation","scope_reduction"])
+        return pd.DataFrame(columns=["asset_id","asset","req_id","requirement","gap","remediation"])
     gaps["remediation"] = gaps.apply(remediation_suggestion, axis=1)
-    merged = gaps.merge(
-        scoped[["asset_id","name","in_scope","stores_chd","processes_chd","transmits_chd","network_segment"]],
-        on="asset_id", how="left"
-    )
-    merged["scope_reduction"] = merged.apply(lambda r: "; ".join(scope_reduction_tips(r)), axis=1)
+    merged = gaps.merge(scoped[["asset_id","name"]], on="asset_id", how="left")
     merged.rename(columns={"name":"asset", "status":"gap"}, inplace=True)
-    return merged[["asset_id","asset","req_id","requirement","gap","remediation","scope_reduction"]]
+    return merged[["asset_id","asset","req_id","requirement","gap","remediation"]]
 
 remediation_df = build_remediation(scoped_df, control_df)
 
 # ------------------------------
-# Report (Excel) generator
+# Report Generator
 # ------------------------------
-def build_excel_report(inventory: pd.DataFrame, scoped: pd.DataFrame,
-                       controls: pd.DataFrame, remediation: pd.DataFrame) -> bytes:
+def build_excel_report(inventory, scoped, controls, remediation) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         inventory.to_excel(writer, index=False, sheet_name="Inventory")
@@ -251,43 +222,67 @@ def build_excel_report(inventory: pd.DataFrame, scoped: pd.DataFrame,
     return output.read()
 
 # ------------------------------
-# SINGLE SCREEN LAYOUT
+# Sidebar Menu
 # ------------------------------
-st.markdown("### 1) Inventory Scanner")
-st.dataframe(inv_df, use_container_width=True)
 
-st.markdown("### 2) Scope Classifier")
-st.info(PCI_SCOPE_NOTE)
-st.dataframe(
-    scoped_df[["asset_id","name","in_scope","scope_reason","network_segment","stores_chd","processes_chd","transmits_chd","chd_present","sensitive_found"]],
-    use_container_width=True
-)
+with st.sidebar.expander("🔎 Agents"):
+    menu = st.selectbox(
+        "Choose an Agent",
+        [
+            "Inventory Scanner",
+            "Scope Classifier",
+            "Control Mapper",
+            "Remediation Planner",
+            "Audit Report Generator"
+        ]
+    )
 
-st.markdown("### 3) Control Mapper")
-st.dataframe(control_df, use_container_width=True)
+st.write(f"👉 You selected: {menu}")
 
-st.markdown("### 4) Remediation Planner")
-if remediation_df.empty:
-    st.success("No gaps found for in-scope assets. 🎉")
-else:
-    st.dataframe(remediation_df, use_container_width=True)
+# ------------------------------
+# Pages based on menu
+# ------------------------------
 
-st.markdown("### 5) Audit Report Generator")
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader("Scope Summary")
-    scope_summary = scoped_df["in_scope"].value_counts(dropna=False).rename_axis("in_scope").reset_index(name="count")
-    st.dataframe(scope_summary, use_container_width=True)
-with c2:
-    st.subheader("Control Status (in-scope only)")
-    in_scope_controls = control_df[control_df["in_scope"]]
-    status_summary = in_scope_controls["status"].value_counts().rename_axis("status").reset_index(name="count")
-    st.dataframe(status_summary, use_container_width=True)
+if menu == "Inventory Scanner":
+    st.subheader("1️⃣ Inventory Scanner")
+    st.dataframe(inv_df, use_container_width=True)
 
-excel_bytes = build_excel_report(inv_df, scoped_df, control_df, remediation_df)
-st.download_button(
-    label="⬇️ Download Auditor-Ready Excel",
-    data=excel_bytes,
-    file_name="pci_dss_mvp_report.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+elif menu == "Scope Classifier":
+    st.subheader("2️⃣ Scope Classifier")
+    st.info(PCI_SCOPE_NOTE)
+    st.dataframe(
+        scoped_df[["asset_id","name","in_scope","scope_reason","network_segment","stores_chd","processes_chd","transmits_chd","chd_present","sensitive_found"]],
+        use_container_width=True
+    )
+
+elif menu == "Control Mapper":
+    st.subheader("3️⃣ Control Mapper")
+    st.dataframe(control_df, use_container_width=True)
+
+elif menu == "Remediation Planner":
+    st.subheader("4️⃣ Remediation Planner")
+    if remediation_df.empty:
+        st.success("No gaps found for in-scope assets. 🎉")
+    else:
+        st.dataframe(remediation_df, use_container_width=True)
+
+elif menu == "Audit Report Generator":
+    st.subheader("5️⃣ Audit Report Generator")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Scope Summary")
+        scope_summary = scoped_df["in_scope"].value_counts(dropna=False).rename_axis("in_scope").reset_index(name="count")
+        st.dataframe(scope_summary, use_container_width=True)
+    with c2:
+        st.subheader("Control Status (in-scope only)")
+        in_scope_controls = control_df[control_df["in_scope"]]
+        status_summary = in_scope_controls["status"].value_counts().rename_axis("status").reset_index(name="count")
+        st.dataframe(status_summary, use_container_width=True)
+
+    excel_bytes = build_excel_report(inv_df, scoped_df, control_df, remediation_df)
+    st.download_button(
+        label="⬇️ Download Auditor-Ready Excel",
+        data=excel_bytes,
+        file_name="pci_dss_mvp_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
