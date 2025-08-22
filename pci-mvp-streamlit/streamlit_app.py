@@ -4,7 +4,17 @@ from typing import List
 import pandas as pd
 import streamlit as st
 import requests
+import streamlit_chat as st_chat
+import google.generativeai as genai
 
+# Configure Google's Generative AI with your API key
+try:
+    genai.configure(api_key="AIzaSyCPqUb-7j41amLpM4QkC0UEUI3r3jUBr6o")
+    chat_model = genai.GenerativeModel("gemini-1.5-flash")
+except Exception as e:
+    st.error(f"Failed to configure Google Generative AI: {e}")
+    st.info("Please add a valid Google API key to enable the chatbot functionality.")
+    chat_model = None
 # ------------------------------
 # Page config
 # ------------------------------
@@ -286,3 +296,84 @@ elif menu == "Audit Report Generator":
         file_name="pci_dss_mvp_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+# --- Chatbot Logic with UI Fixes ---
+
+# Initialize session state for chatbot
+if "chatbot_open" not in st.session_state:
+    st.session_state.chatbot_open = False
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- CSS to create a fixed-position button ---
+st.markdown(
+    """
+    <style>
+    .fixed-button-container {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 1000;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+# --- Chatbot Button and UI ---
+
+# Chatbot button
+if not st.session_state.chatbot_open:
+    with st.container():
+        st.markdown('<div class="fixed-button-container">', unsafe_allow_html=True)
+        if st.button("💬 PCI DSS Chatbot", key="chatbot_toggle_open"):
+            st.session_state.chatbot_open = True
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# Chatbot UI
+if st.session_state.chatbot_open:
+    # Use a single container for the entire chat window with a border and height
+    chat_window = st.container(height=550, border=True)
+
+    with chat_window:
+        # Chat Header
+        c1, c2 = st.columns([0.8, 0.2])
+        with c1:
+            st.markdown("### PCI DSS Chatbot")
+        with c2:
+            if st.button("Close ❌", key="chatbot_toggle_close"):
+                st.session_state.chatbot_open = False
+                st.rerun()
+                
+        # Chat history container with scrollbar
+        chat_history = st.container(height=380)
+        with chat_history:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        # The chat input
+        if prompt := st.chat_input("Ask me about PCI DSS..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+
+            with chat_history:
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+            # Generate and display assistant response
+            if chat_model:
+                try:
+                    with chat_history:
+                        with st.chat_message("assistant"):
+                            response_stream = chat_model.generate_content(
+                                prompt,
+                                stream=True
+                            )
+                            full_response = ""
+                            for chunk in response_stream:
+                                full_response += chunk.text
+                                st.markdown(full_response + " ")
+                            st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except Exception as e:
+                    st.error(f"Error generating response: {e}")
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": "Chatbot is not configured. Please add a valid API key."})
