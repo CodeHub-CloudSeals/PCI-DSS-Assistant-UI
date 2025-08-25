@@ -210,35 +210,18 @@ scoped_df = classify_scope(inv_df)
 # ------------------------------
 # Control Mapper
 # ------------------------------
-CONTROL_LIBRARY = [
-    {"req_id": "REQ-01", "title": "Firewall controls", "text": "Restrict inbound/outbound traffic.", "field": "firewall_enabled", "expected": True},
-    {"req_id": "REQ-02", "title": "Encryption in transit", "text": "Encrypt CHD transmissions.", "field": "encryption_in_transit", "expected": True},
-    {"req_id": "REQ-03", "title": "Encryption at rest", "text": "Render CHD unreadable wherever stored.", "field": "encryption_at_rest", "expected": True},
-    {"req_id": "REQ-04", "title": "Logging & monitoring", "text": "Enable logging to support forensics.", "field": "logging_enabled", "expected": True},
-]
+def build_control_matrix_from_api() -> pd.DataFrame:
+    url = "https://68a71bb6639c6a54e9a100a9.mockapi.io/ControlMapper"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"❌ Could not fetch controls from API. Error: {e}")
+        return pd.DataFrame()
 
-def build_control_matrix(scoped: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, a in scoped.iterrows():
-        for ctrl in CONTROL_LIBRARY:
-            actual = bool(a.get(ctrl["field"], False))
-            met = (actual == ctrl["expected"])
-            rows.append({
-                "asset_id": a["asset_id"],
-                "asset_name": a.get("name"),
-                "in_scope": bool(a.get("in_scope", False)),
-                "req_id": ctrl["req_id"],
-                "requirement": ctrl["title"],
-                "requirement_text": ctrl["text"],
-                "evidence_field": ctrl["field"],
-                "expected": ctrl["expected"],
-                "actual": actual,
-                "status": "Met" if met else "Gap",
-            })
-    return pd.DataFrame(rows)
-
-control_df = build_control_matrix(scoped_df)
-
+control_df = build_control_matrix_from_api()
 # ------------------------------
 # Remediation Planner
 # ------------------------------
@@ -253,14 +236,15 @@ def remediation_suggestion(row: pd.Series) -> str:
         return "Enable audit logging; centralize logs (SIEM)."
     return ""
 
-def build_remediation(scoped: pd.DataFrame, controls: pd.DataFrame) -> pd.DataFrame:
-    gaps = controls[(controls["in_scope"]) & (controls["status"] == "Gap")].copy()
+def build_remediation(assets: pd.DataFrame, controls: pd.DataFrame) -> pd.DataFrame:
+    if "status" not in controls.columns:
+        return pd.DataFrame()
+    gaps = controls[controls["status"] == "Gap"].copy()
     if gaps.empty:
-        return pd.DataFrame(columns=["asset_id","asset","req_id","requirement","gap","remediation"])
-    gaps["remediation"] = gaps.apply(remediation_suggestion, axis=1)
-    merged = gaps.merge(scoped[["asset_id","name"]], on="asset_id", how="left")
-    merged.rename(columns={"name":"asset", "status":"gap"}, inplace=True)
-    return merged[["asset_id","asset","req_id","requirement","gap","remediation"]]
+        return pd.DataFrame()
+    gaps["remediation"] = gaps["title"].apply(remediation_suggestion)
+    return gaps
+
 
 remediation_df = build_remediation(scoped_df, control_df)
 
@@ -280,7 +264,6 @@ def build_excel_report(inventory, scoped, controls, remediation) -> bytes:
 # ------------------------------
 # Sidebar Menu
 # ------------------------------
-
 with st.sidebar.expander("🔎 Agents"):
     menu = st.selectbox(
         "Choose an Agent",
