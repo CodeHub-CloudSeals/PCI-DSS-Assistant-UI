@@ -1,6 +1,6 @@
 import io
 import json
-from typing import List
+from typing import List, Dict, Any
 import pandas as pd
 import streamlit as st
 import requests
@@ -27,45 +27,9 @@ st.set_page_config(
 st.title("PCI DSS Compliance MVP")
 st.caption("Automates: Inventory → Scope → Controls → Remediation → Report")
 
-# ------------------------------
-# Demo inventory (fallback)
-# ------------------------------
-def demo_inventory_df() -> pd.DataFrame:
-    data = [
-        {
-            "asset_id": "vm-001", "name": "checkout-api", "type": "vm",
-            "environment": "prod", "region": "us-east1",
-            "chd_present": True, "stores_chd": False, "processes_chd": True, "transmits_chd": True,
-            "network_segment": "cde",
-            "encryption_at_rest": True, "encryption_in_transit": False,
-            "firewall_enabled": True, "logging_enabled": True, "owner": "payments-team",
-        },
-        {
-            "asset_id": "sql-002", "name": "card-db", "type": "sql",
-            "environment": "prod", "region": "us-central1",
-            "chd_present": True, "stores_chd": True, "processes_chd": False, "transmits_chd": False,
-            "network_segment": "cde",
-            "encryption_at_rest": False, "encryption_in_transit": True,
-            "firewall_enabled": True, "logging_enabled": True, "owner": "dba",
-        },
-        {
-            "asset_id": "lb-003", "name": "edge-lb", "type": "load_balancer",
-            "environment": "prod", "region": "europe-west1",
-            "chd_present": False, "stores_chd": False, "processes_chd": False, "transmits_chd": True,
-            "network_segment": "dmz",
-            "encryption_at_rest": True, "encryption_in_transit": True,
-            "firewall_enabled": False, "logging_enabled": False, "owner": "platform",
-        },
-        {
-            "asset_id": "vm-004", "name": "marketing-site", "type": "vm",
-            "environment": "prod", "region": "us-east1",
-            "chd_present": False, "stores_chd": False, "processes_chd": False, "transmits_chd": False,
-            "network_segment": "public",
-            "encryption_at_rest": True, "encryption_in_transit": True,
-            "firewall_enabled": True, "logging_enabled": True, "owner": "marketing",
-        },
-    ]
-    return pd.DataFrame(data)
+# --- Initialize session state for uploaded files ---
+if 'uploaded_files' not in st.session_state:
+    st.session_state['uploaded_files'] = []
 
 # ------------------------------
 # Fetch inventory from MockAPI
@@ -81,34 +45,116 @@ def fetch_inventory_from_api() -> pd.DataFrame:
         else:
             return pd.DataFrame([data])
     except Exception as e:
-        st.warning(f"⚠️ Could not fetch from API, using demo data instead. Error: {e}")
-        return demo_inventory_df()
+        st.error(f"❌ Could not fetch from API. Error: {e}")
+    st.stop()
 
-# ------------------------------
-# Uploads + parsing
-# ------------------------------
-with st.sidebar.expander("Uploads (optional) — Inventory & DLP", expanded=False):
-    inv_file = st.file_uploader("Inventory (CSV or JSON)", type=["csv", "json"])
-    dlp_file = st.file_uploader("DLP findings CSV (asset_id, sensitive_found)", type=["csv"])
+# --- Unified Uploads Dashboard Section ---
+st.markdown("### 📂 Uploads — Inventory & DLP")
 
-def parse_inventory_upload(upload) -> pd.DataFrame:
+uploaded_file = st.file_uploader(
+    "Drag and drop files here (CSV or JSON)",
+    type=["csv", "json"],
+    accept_multiple_files=True,
+    help="You can upload multiple files at once. Each file will be processed based on its name (e.g., 'inventory' or 'dlp' in the filename)."
+)
+
+def parse_upload(upload) -> Dict[str, Any]:
+    """Parses a single uploaded file and returns its data and metadata."""
     if upload is None:
-        return fetch_inventory_from_api()
+        return {}
+    
     name = upload.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(upload)
-    if name.endswith(".json"):
-        raw = json.load(upload)
-        return pd.json_normalize(raw)
-    raise ValueError("Unsupported file type. Upload CSV or JSON.")
+    
+    # Heuristics to determine file type
+    file_type = "Unknown"
+    if "inventory" in name:
+        file_type = "Inventory"
+    elif "dlp" in name:
+        file_type = "DLP Findings"
+        
+    try:
+        if name.endswith(".csv"):
+            df = pd.read_csv(upload)
+        elif name.endswith(".json"):
+            # Attempt to parse as a single JSON object
+            try:
+                raw = json.load(upload)
+                df = pd.json_normalize(raw)
+            except json.JSONDecodeError:
+                # If it fails, try parsing line by line
+                upload.seek(0)  # Rewind the file pointer
+                data = [json.loads(line) for line in upload]
+                df = pd.json_normalize(data)
 
-def merge_dlp_findings(inv_df: pd.DataFrame, dlp_upload) -> pd.DataFrame:
+        else:
+            raise ValueError("Unsupported file type.")
+
+        return {
+            "name": upload.name,
+            "type": file_type,
+            "size": upload.size,
+            "df": df,
+            "uploaded_at": pd.Timestamp.now()
+        }
+    except Exception as e:
+        st.error(f"Error parsing {upload.name}: {e}")
+        return {}
+
+def process_uploads(uploads: List[Any]):
+    """Processes new uploads, adds them to session state, and identifies the latest of each type."""
+    if not uploads:
+        return None, None
+    
+    # Add new uploads to the list
+    for upload in uploads:
+        parsed_data = parse_upload(upload)
+        if parsed_data:
+            st.session_state.uploaded_files.append(parsed_data)
+    
+    # Find the latest inventory and DLP files
+    latest_inv_upload = None
+    latest_dlp_upload = None
+    
+    sorted_files = sorted(st.session_state.uploaded_files, key=lambda x: x['uploaded_at'], reverse=True)
+    
+    for f in sorted_files:
+        if f['type'] == "Inventory" and latest_inv_upload is None:
+            latest_inv_upload = f
+        elif f['type'] == "DLP Findings" and latest_dlp_upload is None:
+            latest_dlp_upload = f
+
+    return latest_inv_upload, latest_dlp_upload
+
+# Process uploads from the file uploader
+latest_inv_upload, latest_dlp_upload = process_uploads(uploaded_file)
+
+# Display a table of previously uploaded files
+if st.session_state.uploaded_files:
+    st.subheader("📝 Previously Uploaded Files")
+    files_to_display = []
+    for f in st.session_state.uploaded_files:
+        files_to_display.append({
+            "File Name": f["name"],
+            "File Type": f["type"],
+            "Size (KB)": round(f["size"] / 1024, 2),
+            "Uploaded At": f["uploaded_at"].strftime("%Y-%m-%d %H:%M:%S")
+        })
+    st.dataframe(pd.DataFrame(files_to_display), use_container_width=True)
+
+def parse_inventory_data(inv_data) -> pd.DataFrame:
+    if inv_data is None:
+        return fetch_inventory_from_api()
+    return inv_data['df']
+
+def merge_dlp_findings(inv_df: pd.DataFrame, dlp_data) -> pd.DataFrame:
     df = inv_df.copy()
     if "sensitive_found" not in df.columns:
         df["sensitive_found"] = False
-    if dlp_upload is None:
+    
+    if dlp_data is None:
         return df
-    dlp = pd.read_csv(dlp_upload)
+    
+    dlp = dlp_data['df']
     if not {"asset_id", "sensitive_found"}.issubset(dlp.columns):
         st.warning("DLP file must have columns: asset_id, sensitive_found. Ignoring DLP upload.")
         return df
@@ -118,8 +164,8 @@ def merge_dlp_findings(inv_df: pd.DataFrame, dlp_upload) -> pd.DataFrame:
     return df.drop(columns=[c for c in df.columns if c.endswith("_dlp")])
 
 try:
-    inv_df = parse_inventory_upload(inv_file)
-    inv_df = merge_dlp_findings(inv_df, dlp_file)
+    inv_df = parse_inventory_data(latest_inv_upload)
+    inv_df = merge_dlp_findings(inv_df, latest_dlp_upload)
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
