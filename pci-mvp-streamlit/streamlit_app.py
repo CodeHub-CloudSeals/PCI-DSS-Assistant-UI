@@ -35,7 +35,7 @@ if 'uploaded_files' not in st.session_state:
 # Fetch inventory from MockAPI
 # ------------------------------
 def fetch_inventory_from_api() -> pd.DataFrame:
-    url = "https://68a71bb6639c6a54e9a100a9.mockapi.io/Inventory"
+    url = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/Inventory"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
@@ -211,7 +211,7 @@ scoped_df = classify_scope(inv_df)
 # Control Mapper
 # ------------------------------
 def build_control_matrix_from_api() -> pd.DataFrame:
-    url = "https://68a71bb6639c6a54e9a100a9.mockapi.io/ControlMapper"
+    url = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/ControlMapper"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
