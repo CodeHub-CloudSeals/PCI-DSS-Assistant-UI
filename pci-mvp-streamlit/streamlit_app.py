@@ -67,10 +67,14 @@ def parse_upload(upload) -> Dict[str, Any]:
     
     # Heuristics to determine file type
     file_type = "Unknown"
-    if "inventory" in name:
+    if "inv" in name or "inventory" in name:
         file_type = "Inventory"
     elif "dlp" in name:
         file_type = "DLP Findings"
+
+    if file_type == "Unknown":
+        st.error(f"Could not determine file type for '{upload.name}'. Please make sure the filename contains 'inventory' or 'dlp'.")
+        return {}
         
     try:
         if name.endswith(".csv"):
@@ -142,6 +146,9 @@ if st.session_state.uploaded_files:
     st.dataframe(pd.DataFrame(files_to_display), use_container_width=True)
 
 def parse_inventory_data(inv_data) -> pd.DataFrame:
+    # This function is now working as intended because inv_data will not be None
+    # if an inventory file is successfully uploaded and detected by the corrected
+    # `parse_upload` function.
     if inv_data is None:
         return fetch_inventory_from_api()
     return inv_data['df']
