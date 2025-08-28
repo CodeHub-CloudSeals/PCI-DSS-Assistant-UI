@@ -556,7 +556,7 @@ elif menu == "Audit Report Generator":
 # 📚 NEW: Knowledge (Neo4j + Popoto.js)
 # ------------------------------
 elif menu == "Knowledge":
-    st.subheader("6️⃣ Knowledge — Neo4j + Popoto.js")
+    st.subheader("6️ Knowledge — Neo4j + Popoto.js")
 
     with st.sidebar:
         st.markdown("### 🔌 Neo4j Connection")
