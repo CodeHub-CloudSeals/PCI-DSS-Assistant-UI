@@ -17,46 +17,46 @@ def run_cypher_query(query, params=None):
 # --- Load graph ---
 if st.button("Load Graph"):
     try:
-        # Get nodes with properties
-        nodes = run_cypher_query("""
-            MATCH (n) 
-            RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props 
-            LIMIT 50
-        """)
-
-        # Get relationships
-        rels = run_cypher_query("""
-            MATCH (a)-[r]->(b) 
-            RETURN id(a) AS source, id(b) AS target, type(r) AS type, properties(r) AS props 
-            LIMIT 50
+        # Fetch relationships and their connected nodes together to avoid dangling edges
+        rel_rows = run_cypher_query("""
+            MATCH (a)-[r]->(b)
+            RETURN id(a) AS source_id,
+                   labels(a) AS source_labels,
+                   properties(a) AS source_props,
+                   id(b) AS target_id,
+                   labels(b) AS target_labels,
+                   properties(b) AS target_props,
+                   type(r) AS rel_type,
+                   properties(r) AS rel_props
+            LIMIT 200
         """)
 
         # Build Pyvis network
-        net = Network(height="600px", width="100%", bgcolor="#ffffff", font_color="black", directed=True)
+        net = Network(height="850px", width="100%", bgcolor="#ffffff", font_color="black", directed=True)
 
-        # Add nodes with labels + properties
-        for node in nodes:
-            node_id = node["id"]
-            label = ", ".join(node["labels"])  # Node labels
-            props = node["props"]
+        added_nodes = set()
 
-            # Display one main property as node label (e.g., name/id if exists)
-            display_label = props.get("name") or props.get("id") or label
-
-            # Tooltip shows all properties
-            tooltip = "<br>".join([f"{k}: {v}" for k, v in props.items()])
-
+        def add_node_if_needed(node_id, labels, props):
+            if node_id in added_nodes:
+                return
+            safe_props = props or {}
+            label_text = ", ".join(labels) if labels else "Node"
+            display_label = safe_props.get("name") or safe_props.get("id") or label_text
+            tooltip = "<br>".join([f"{k}: {v}" for k, v in safe_props.items()]) if safe_props else ""
             net.add_node(node_id, label=str(display_label), title=tooltip)
+            added_nodes.add(node_id)
 
-        # Add relationships with type + properties
-        for rel in rels:
-            rel_type = rel["type"]
-            rel_props = rel["props"]
+        # Add nodes and edges
+        for row in rel_rows:
+            src_id = row["source_id"]
+            tgt_id = row["target_id"]
+            add_node_if_needed(src_id, row.get("source_labels"), row.get("source_props"))
+            add_node_if_needed(tgt_id, row.get("target_labels"), row.get("target_props"))
 
-            # Tooltip for relationships
+            rel_type = row.get("rel_type")
+            rel_props = row.get("rel_props") or {}
             rel_tooltip = "<br>".join([f"{k}: {v}" for k, v in rel_props.items()]) if rel_props else ""
-
-            net.add_edge(rel["source"], rel["target"], label=rel_type, title=rel_tooltip)
+            net.add_edge(src_id, tgt_id, label=rel_type, title=rel_tooltip)
 
         # Save and display inside Streamlit
         with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp_file:
