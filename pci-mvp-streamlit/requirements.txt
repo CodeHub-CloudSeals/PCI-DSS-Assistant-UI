@@ -26,3 +26,7 @@ pyyaml
 # Chatbot Functionality
 streamlit-chat
 google-generativeai
+
+neo4j
+pyvis
+

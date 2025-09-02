@@ -1,32 +1,45 @@
 import io
 import json
+import os
 from typing import List, Dict, Any
 import pandas as pd
 import streamlit as st
 import requests
 import streamlit_chat as st_chat
 import google.generativeai as genai
+import streamlit.components.v1 as components
+from dotenv import load_dotenv
 
-# 👇 NEW: optional Neo4j driver & Streamlit components
+# Neo4j Driver
 try:
     from neo4j import GraphDatabase
     NEO4J_AVAILABLE = True
 except Exception:
     NEO4J_AVAILABLE = False
 
-import streamlit.components.v1 as components
+# Load environment variables
+load_dotenv()
+
+# Import configuration
+try:
+    from config import GOOGLE_API_KEY, MOCK_API_INVENTORY, MOCK_API_CONTROLS
+except ImportError:
+    # Fallback values if config import fails
+    GOOGLE_API_KEY = "AIzaSyCPqUb-7j41amLpM4QkC0UEUI3r3jUBr6o"
+    MOCK_API_INVENTORY = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/Inventory"
+    MOCK_API_CONTROLS = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/ControlMapper"
 
 # Configure Google's Generative AI with your API key
 try:
-    genai.configure(api_key="AIzaSyCPqUb-7j41amLpM4QkC0UEUI3r3jUBr6o")
+    genai.configure(api_key=GOOGLE_API_KEY)
     chat_model = genai.GenerativeModel("gemini-1.5-flash")
 except Exception as e:
     st.error(f"Failed to configure Google Generative AI: {e}")
     st.info("Please add a valid Google API key to enable the chatbot functionality.")
     chat_model = None
-# ------------------------------
+# -----------------------------
 # Page config
-# ------------------------------
+# -----------------------------
 st.set_page_config(
     page_title="PCI DSS Compliance MVP",
     page_icon="✅",
@@ -44,7 +57,7 @@ if 'uploaded_files' not in st.session_state:
 # Fetch inventory from MockAPI
 # ------------------------------
 def fetch_inventory_from_api() -> pd.DataFrame:
-    url = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/Inventory"
+    url = MOCK_API_INVENTORY
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
@@ -155,6 +168,9 @@ if st.session_state.uploaded_files:
     st.dataframe(pd.DataFrame(files_to_display), use_container_width=True)
 
 def parse_inventory_data(inv_data) -> pd.DataFrame:
+    # This function is now working as intended because inv_data will not be None
+    # if an inventory file is successfully uploaded and detected by the corrected
+    # `parse_upload` function.
     if inv_data is None:
         return fetch_inventory_from_api()
     return inv_data['df']
@@ -224,7 +240,7 @@ scoped_df = classify_scope(inv_df)
 # Control Mapper
 # ------------------------------
 def build_control_matrix_from_api() -> pd.DataFrame:
-    url = "https://68ae8e19b91dfcdd62b97c34.mockapi.io/ControlMapper"
+    url = MOCK_API_CONTROLS
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
@@ -273,215 +289,106 @@ def build_excel_report(inventory, scoped, controls, remediation) -> bytes:
         remediation.to_excel(writer, index=False, sheet_name="Remediation")
     output.seek(0)
     return output.read()
-
 # ------------------------------
-# 🔌 NEW: Neo4j helpers
+# Neo4j Push + Graph
 # ------------------------------
-def get_neo4j_settings():
-    uri = st.secrets.get("NEO4J_URI", "") if hasattr(st, "secrets") else ""
-    user = st.secrets.get("NEO4J_USER", "") if hasattr(st, "secrets") else ""
-    pwd = st.secrets.get("NEO4J_PASSWORD", "") if hasattr(st, "secrets") else ""
-    db = st.secrets.get("NEO4J_DATABASE", "neo4j") if hasattr(st, "secrets") else "neo4j"
-    return uri, user, pwd, db
+def push_graph_to_neo4j(uri, user, pwd, database, inv, controls):
+    def to_neo4j_ssc(u: str) -> str:
+        if u.startswith("neo4j+s://"):
+            return u.replace("neo4j+s://", "neo4j+ssc://")
+        if u.startswith("neo4j://"):
+            return u.replace("neo4j://", "neo4j+ssc://")
+        if u.startswith("bolt://"):
+            return u.replace("bolt://", "neo4j+ssc://")
+        if u.startswith("bolt+ssc://"):
+            return u.replace("bolt+ssc://", "neo4j+ssc://")
+        return u
 
-def push_graph_to_neo4j(uri: str, user: str, pwd: str, database: str,
-                        inv: pd.DataFrame, controls: pd.DataFrame):
-    """
-    Creates a minimal PCI knowledge graph:
-    (:Asset {asset_id, name, in_scope, segment, sensitive_found})
-    (:Control {req_id, title, status})
-    (Asset)-[:HAS_CONTROL]->(Control) when applicable by req_id (best-effort).
-    """
-    if not NEO4J_AVAILABLE:
-        st.error("neo4j driver not installed. Run: pip install neo4j")
+    def try_push(target_uri: str):
+        driver = GraphDatabase.driver(target_uri, auth=(user, pwd))
+        # Lightweight connectivity check first
+        with driver.session(database=database) as session:
+            session.run("RETURN 1 AS ok").single()
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Asset) REQUIRE a.asset_id IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Control) REQUIRE c.req_id IS UNIQUE")
+
+            for _, r in inv.iterrows():
+                session.run(
+                    """
+                    MERGE (a:Asset {asset_id:$id})
+                    SET a.name=$name, a.in_scope=$scope, a.segment=$seg, a.sensitive_found=$sens
+                    """,
+                    {
+                        "id": str(r.get("asset_id")),
+                        "name": str(r.get("name", "")),
+                        "scope": bool(r.get("in_scope", False)),
+                        "seg": str(r.get("network_segment", "")),
+                        "sens": bool(r.get("sensitive_found", False)),
+                    },
+                )
+
+            for _, r in controls.iterrows():
+                session.run(
+                    """
+                    MERGE (c:Control {req_id:$id})
+                    SET c.title=$title, c.status=$status
+                    """,
+                    {
+                        "id": str(r.get("req_id")),
+                        "title": str(r.get("title", "")),
+                        "status": str(r.get("status", "")),
+                    },
+                )
+        driver.close()
+
+    # First attempt as-given
+    try:
+        try_push(uri)
+        return True
+    except Exception as e:
+        msg = str(e)
+        # One retry with neo4j+ssc which accepts self-signed certs and uses routing
+        retry_uri = to_neo4j_ssc(uri)
+        if retry_uri != uri:
+            try:
+                try_push(retry_uri)
+                st.info(f"Retried with {retry_uri} and succeeded")
+                return True
+            except Exception as e2:
+                st.error(f"Neo4j push failed after retry with {retry_uri}: {e2}")
+        else:
+            st.error(f"Neo4j push failed: {msg}")
+
+        st.warning("""
+Troubleshooting tips:
+- Ensure your Neo4j Aura instance is RUNNING.
+- Use a routed URI with TLS: neo4j+ssc://<host>:7687
+- Verify your IP is allowed in Aura's IP allowlist (or disable allowlist for testing).
+- Ensure outbound port 7687 is open on your network.
+- Credentials (username/password) must be correct.
+""")
         return False
 
-    driver = GraphDatabase.driver(uri, auth=(user, pwd))
-    def run_write(tx, query, params=None):
-        tx.run(query, params or {})
-
-    with driver.session(database=database) as session:
-        # Basic schema (indexes)
-        session.execute_write(
-            run_write,
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Asset) REQUIRE a.asset_id IS UNIQUE"
-        )
-        session.execute_write(
-            run_write,
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Control) REQUIRE c.req_id IS UNIQUE"
-        )
-
-        # Upsert Assets
-        for _, r in inv.fillna("").iterrows():
-            asset_id = str(r.get("asset_id", "")).strip()
-            if not asset_id:
-                continue
-            session.execute_write(
-                run_write,
-                """
-                MERGE (a:Asset {asset_id:$asset_id})
-                SET a.name = COALESCE($name, a.name),
-                    a.in_scope = $in_scope,
-                    a.network_segment = $segment,
-                    a.sensitive_found = $sensitive_found
-                """,
-                {
-                    "asset_id": asset_id,
-                    "name": str(r.get("name", ""))[:200],
-                    "in_scope": bool(r.get("in_scope", False)),
-                    "segment": str(r.get("network_segment", ""))[:60],
-                    "sensitive_found": bool(r.get("sensitive_found", False)),
-                }
-            )
-
-        # Upsert Controls
-        for _, r in controls.fillna("").iterrows():
-            req_id = str(r.get("req_id", "")).strip()
-            if not req_id:
-                continue
-            session.execute_write(
-                run_write,
-                """
-                MERGE (c:Control {req_id:$req_id})
-                SET c.title = COALESCE($title, c.title),
-                    c.status = $status
-                """,
-                {
-                    "req_id": req_id,
-                    "title": str(r.get("title", ""))[:300],
-                    "status": str(r.get("status", ""))[:60],
-                }
-            )
-
-        # Link Assets to Controls (best-effort: if inv has a column 'req_id' or 'controls')
-        # 1) If inventory rows list a single req_id
-        if "req_id" in inv.columns:
-            for _, r in inv.fillna("").iterrows():
-                asset_id = str(r.get("asset_id", "")).strip()
-                req = str(r.get("req_id", "")).strip()
-                if asset_id and req:
-                    session.execute_write(
-                        run_write,
-                        """
-                        MATCH (a:Asset {asset_id:$asset_id}), (c:Control {req_id:$req})
-                        MERGE (a)-[:HAS_CONTROL]->(c)
-                        """,
-                        {"asset_id": asset_id, "req": req}
-                    )
-
-        # 2) If inventory rows list multiple controls in a 'controls' column (CSV or list)
-        if "controls" in inv.columns:
-            for _, r in inv.fillna("").iterrows():
-                asset_id = str(r.get("asset_id", "")).strip()
-                if not asset_id:
-                    continue
-                controls_cell = r.get("controls", "")
-                if isinstance(controls_cell, str) and controls_cell:
-                    reqs = [x.strip() for x in controls_cell.split(",") if x.strip()]
-                elif isinstance(controls_cell, list):
-                    reqs = [str(x).strip() for x in controls_cell if str(x).strip()]
-                else:
-                    reqs = []
-                for req in reqs:
-                    session.execute_write(
-                        run_write,
-                        """
-                        MATCH (a:Asset {asset_id:$asset_id}), (c:Control {req_id:$req})
-                        MERGE (a)-[:HAS_CONTROL]->(c)
-                        """,
-                        {"asset_id": asset_id, "req": req}
-                    )
-
-    driver.close()
-    return True
-
-def render_popoto_html(uri: str, user: str, pwd: str, database: str = "neo4j") -> str:
+def render_popoto_html(uri, user, pwd, db="neo4j"):
+    return f"""
+    <!doctype html>
+    <html>
+      <head>
+        <script src="https://unpkg.com/neo4j-driver"></script>
+        <script src="https://unpkg.com/popotojs"></script>
+        <link rel="stylesheet" href="https://unpkg.com/popotojs/dist/popoto.css"/>
+      </head>
+      <body>
+        <div id="graph"></div>
+        <script>
+          const driver = neo4j.driver("{uri}", neo4j.auth.basic("{user}", "{pwd}"));
+          popoto.rest.driver = driver;
+          popoto.rest.database = "{db}";
+          popoto.start("graph", ["Asset"]);
+        </script>
+      </body>
+    </html>
     """
-    Returns an HTML page embedding Popoto.js and connecting with the Neo4j JS driver.
-    Taxonomy: start from Asset; you can expand to Control via HAS_CONTROL.
-    """
-    # Minimal safe escaping
-    uri_js = uri.replace('"', '\\"')
-    user_js = user.replace('"', '\\"')
-    pwd_js = pwd.replace('"', '\\"')
-    db_js = database.replace('"', '\\"')
-
-    # Popoto expects D3 and Neo4j JS Driver; we use UMD bundles from unpkg
-    html = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Popoto Graph</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    html, body {{ height: 100%; margin: 0; }}
-    #root {{ height: 100%; display:flex; flex-direction:column; font-family: sans-serif; }}
-    #toolbar {{ padding:8px 12px; border-bottom:1px solid #eee; }}
-    #graph {{ flex:1; }}
-    .pp-toolbar {{ background:#fafafa; }}
-  </style>
-  <script src="https://unpkg.com/d3@7"></script>
-  <script src="https://unpkg.com/neo4j-driver"></script>
-  <link rel="stylesheet" href="https://unpkg.com/popoto/dist/popoto.min.css"/>
-  <script src="https://unpkg.com/popoto/dist/popoto.min.js"></script>
-</head>
-<body>
-<div id="root">
-  <div id="toolbar">
-    <strong>Popoto.js • PCI Knowledge Graph</strong>
-    <span style="margin-left:10px;color:#666;">Start with Assets → expand to Controls</span>
-  </div>
-  <div id="graph" class="pp-graph"></div>
-</div>
-
-<script>
-(async function() {{
-  try {{
-    const driver = neo4j.driver("{uri_js}", neo4j.auth.basic("{user_js}", "{pwd_js}"));
-    const session = driver.session({{ database: "{db_js}" }});
-    // Give Popoto the Neo4j driver instance (Popoto 3+)
-    popoto.rest.DRIVER = driver;
-    popoto.rest.SESSION_OPTS = {{ database: "{db_js}" }};
-
-    // Define simple label provider: Asset and Control
-    popoto.provider.node.Provider = {{
-      "Asset": {{
-        "returnProperties": ["asset_id","name","in_scope","network_segment","sensitive_found"],
-        "constraintAttribute": "asset_id",
-        "autoExpandRelations": true
-      }},
-      "Control": {{
-        "returnProperties": ["req_id","title","status"],
-        "constraintAttribute": "req_id"
-      }}
-    }};
-
-    popoto.provider.link.Provider = [
-      {{
-        "link" : "HAS_CONTROL",
-        "range" : "Control",
-        "domain" : "Asset",
-        "direction": "out"
-      }}
-    ];
-
-    // Start from Asset label
-    popoto.tools.CONFIG.SHOW_QUERY = true;
-    popoto.start("graph", ["Asset"]);
-
-    // Clean up on page unload
-    window.addEventListener("beforeunload", async () => {{ await driver.close(); }});
-  }} catch (e) {{
-    document.body.innerHTML = "<pre style='padding:16px'>Popoto init error:\\n"+ (e && e.message ? e.message : e) +"</pre>";
-  }}
-}})();
-</script>
-</body>
-</html>
-"""
-    return html
-
 # ------------------------------
 # Sidebar Menu
 # ------------------------------
@@ -493,14 +400,44 @@ with st.sidebar.expander("🔎 Agents"):
             "Scope Classifier",
             "Control Mapper",
             "Remediation Planner",
-            "Audit Report Generator",
-            "Knowledge"  # 👈 NEW option
+            "Audit Report Generator"
         ]
     )
 
-# 👇 NEW: explicit Knowledge button in sidebar (sets the same `menu`)
-if st.sidebar.button("Knowledge"):
-    menu = "Knowledge"
+# Separate Knowledge Graph button outside the expander
+if "show_kg" not in st.session_state:
+    st.session_state.show_kg = False
+if st.sidebar.button("Knowledge Graph", key="open_kg_button"):
+    st.session_state.show_kg = True
+
+# If Knowledge Graph is toggled, render it exclusively and stop further rendering
+if st.session_state.get("show_kg"):
+    st.subheader("Knowledge Graph (Neo4j + Popoto.js)")
+    try:
+        from config import NEO4J_URI, NEO4J_USER, NEO4J_PASS
+        uri = st.session_state.get("working_uri") or NEO4J_URI
+        user = NEO4J_USER
+        pwd = NEO4J_PASS
+    except ImportError:
+        uri = "neo4j+ssc://8871b289.databases.neo4j.io:7687"
+        user = "neo4j"
+        pwd = "vRksbVfn6v4HnvuqyhpQnUeK74edAAdaYKmvkxYCsR0"
+    db = "neo4j"
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("🚀 Push Data to Neo4j", key="push_kg_only"):
+            if push_graph_to_neo4j(uri, user, pwd, db, scoped_df, control_df):
+                st.success("✅ Data pushed successfully!")
+    with c2:
+        if st.button("⬅️ Back to App", key="close_kg_only"):
+            st.session_state.show_kg = False
+            st.rerun()
+
+    st.markdown("### 📈 Graph Viewer")
+    html = render_popoto_html(uri, user, pwd, db)
+    components.html(html, height=800, scrolling=True)
+    st.stop()
 
 st.write(f"👉 You selected: {menu}")
 
@@ -551,57 +488,6 @@ elif menu == "Audit Report Generator":
         file_name="pci_dss_mvp_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-# ------------------------------
-# 📚 NEW: Knowledge (Neo4j + Popoto.js)
-# ------------------------------
-elif menu == "Knowledge":
-    st.subheader("6️ Knowledge — Neo4j + Popoto.js")
-
-    with st.sidebar:
-        st.markdown("### 🔌 Neo4j Connection")
-        default_uri, default_user, default_pwd, default_db = get_neo4j_settings()
-        neo4j_uri = st.text_input("URI", value=default_uri, placeholder="neo4j+s://<host>:7687")
-        neo4j_user = st.text_input("User", value=default_user or "neo4j")
-        neo4j_pwd = st.text_input("Password", value=default_pwd, type="password")
-        neo4j_db = st.text_input("Database", value=default_db or "neo4j")
-        st.caption("Tip: Set NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE in st.secrets to avoid typing.")
-
-        push_btn = st.button("🚀 Build / Update Knowledge Graph in Neo4j")
-
-    # Show what will be pushed
-    with st.expander("Preview data to push (first 50 rows)"):
-        st.write("**Assets (inventory + scope)**")
-        try:
-            preview_assets = scoped_df[["asset_id","name","in_scope","network_segment","sensitive_found"]].head(50)
-        except Exception:
-            preview_assets = inv_df.head(50)
-        st.dataframe(preview_assets, use_container_width=True)
-        st.write("**Controls**")
-        st.dataframe(control_df.head(50), use_container_width=True)
-
-    # Push data to Neo4j
-    if push_btn:
-        if not neo4j_uri or not neo4j_user or not neo4j_pwd:
-            st.error("Please provide Neo4j URI, username and password.")
-        else:
-            try:
-                ok = push_graph_to_neo4j(neo4j_uri, neo4j_user, neo4j_pwd, neo4j_db, scoped_df, control_df)
-                if ok:
-                    st.success("✅ Data pushed to Neo4j successfully.")
-                else:
-                    st.error("❌ Could not push data to Neo4j (driver missing or connection issue).")
-            except Exception as e:
-                st.error(f"Neo4j push error: {e}")
-
-    st.markdown("---")
-    st.markdown("#### 📈 Popoto.js Graph Viewer")
-    st.caption("Interactive graph backed by your Neo4j DB. Start from **Asset**; expand relationships to **Control**.")
-    if neo4j_uri and neo4j_user and neo4j_pwd:
-        html = render_popoto_html(neo4j_uri, neo4j_user, neo4j_pwd, neo4j_db)
-        components.html(html, height=800, scrolling=True)
-    else:
-        st.info("Enter Neo4j connection details in the sidebar to load the Popoto viewer.")
 
 # --- Chatbot Logic with UI Fixes ---
 
